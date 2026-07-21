@@ -4,21 +4,35 @@ import { useEffect, useState } from 'react';
 import { supabase, Joke, Category, getVisitorId, getNickname, setNickname } from '@/lib/supabase';
 
 type Tab = 'list' | 'new' | 'leader';
+type RatingRow = { joke_id: string; user_id_or_ip: string; score: number };
+
+function hashCode(str: string): number {
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) {
+    hash = (hash << 5) - hash + str.charCodeAt(i);
+    hash |= 0;
+  }
+  return hash;
+}
 
 export default function Home() {
   const [tab, setTab] = useState<Tab>('list');
   const [jokes, setJokes] = useState<Joke[]>([]);
+  const [allRatings, setAllRatings] = useState<RatingRow[]>([]);
   const [categories, setCategories] = useState<Category[]>([]);
   const [loading, setLoading] = useState(true);
   const [nickname, setNick] = useState('');
   const [filterCat, setFilterCat] = useState('Alle');
-  const [sort, setSort] = useState<'new' | 'top'>('new');
+  const [sort, setSort] = useState<'new' | 'top' | 'random'>('top');
+  const [excludeOwn, setExcludeOwn] = useState(false);
+  const [randomSeed, setRandomSeed] = useState(0);
   const [leaderboard, setLeaderboard] = useState<{ username: string; credits: number }[]>([]);
 
   useEffect(() => {
     setNick(getNickname());
     loadCategories();
     loadJokes();
+    loadAllRatings();
   }, []);
 
   async function loadCategories() {
@@ -36,6 +50,23 @@ export default function Home() {
       .order('created_at', { ascending: false });
     if (data) setJokes(data as unknown as Joke[]);
     setLoading(false);
+  }
+
+  async function loadAllRatings() {
+    const { data } = await supabase.from('ratings').select('joke_id, user_id_or_ip, score');
+    if (data) setAllRatings(data as RatingRow[]);
+  }
+
+  // Durchschnitt und Anzahl fuer einen Witz berechnen - je nachdem ob eigene
+  // Bewertungen (dieses Geraet) ausgeschlossen werden sollen
+  function computeRating(jokeId: string): { avg: number; count: number } {
+    const myId = getVisitorId();
+    const relevant = allRatings.filter(
+      (r) => r.joke_id === jokeId && (!excludeOwn || r.user_id_or_ip !== myId)
+    );
+    if (!relevant.length) return { avg: 0, count: 0 };
+    const sum = relevant.reduce((a, r) => a + r.score, 0);
+    return { avg: sum / relevant.length, count: relevant.length };
   }
 
   async function loadLeaderboard() {
@@ -117,7 +148,7 @@ export default function Home() {
       alert('Fehler: ' + error.message);
       return;
     }
-    await loadJokes();
+    await loadAllRatings();
   }
 
   async function reportJoke(jokeId: string) {
@@ -211,11 +242,23 @@ export default function Home() {
     ? jokes
     : jokes.filter((j) => j.categories?.name === filterCat);
 
-  visibleJokes = [...visibleJokes].sort((a, b) =>
-    sort === 'new'
-      ? new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
-      : b.avg_rating - a.avg_rating
-  );
+  if (sort === 'new') {
+    visibleJokes = [...visibleJokes].sort(
+      (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+    );
+  } else if (sort === 'top') {
+    visibleJokes = [...visibleJokes].sort(
+      (a, b) => computeRating(b.id).avg - computeRating(a.id).avg
+    );
+  } else if (sort === 'random') {
+    // Seed sorgt dafuer, dass "Neu mischen" eine andere Reihenfolge ergibt,
+    // aber innerhalb eines Ladevorgangs stabil bleibt
+    visibleJokes = [...visibleJokes].sort((a, b) => {
+      const ha = hashCode(a.id + randomSeed);
+      const hb = hashCode(b.id + randomSeed);
+      return ha - hb;
+    });
+  }
 
   return (
     <main className="max-w-2xl mx-auto px-5 py-6 pb-20">
@@ -254,7 +297,7 @@ export default function Home() {
 
       {tab === 'list' && (
         <>
-          <div className="flex gap-2 mb-4 flex-wrap">
+          <div className="flex gap-2 mb-4 flex-wrap items-center">
             <select
               value={filterCat}
               onChange={(e) => setFilterCat(e.target.value)}
@@ -269,12 +312,29 @@ export default function Home() {
             </select>
             <select
               value={sort}
-              onChange={(e) => setSort(e.target.value as 'new' | 'top')}
+              onChange={(e) => setSort(e.target.value as 'new' | 'top' | 'random')}
               className="border border-ink bg-white px-2 py-1.5 text-xs"
             >
-              <option value="new">Neueste</option>
               <option value="top">Beste Bewertung</option>
+              <option value="new">Neueste</option>
+              <option value="random">Zufällig</option>
             </select>
+            {sort === 'random' && (
+              <button
+                onClick={() => setRandomSeed(Math.random())}
+                className="border border-ink bg-white px-2 py-1.5 text-xs"
+              >
+                Neu mischen
+              </button>
+            )}
+            <label className="flex items-center gap-1.5 text-xs text-gray-600 ml-1">
+              <input
+                type="checkbox"
+                checked={excludeOwn}
+                onChange={(e) => setExcludeOwn(e.target.checked)}
+              />
+              Eigene Bewertungen ausschliessen
+            </label>
           </div>
 
           {loading ? (
@@ -288,6 +348,7 @@ export default function Home() {
               <JokeCard
                 key={j.id}
                 joke={j}
+                rating={computeRating(j.id)}
                 onRate={rateJoke}
                 onReport={reportJoke}
                 onReportDuplicate={reportDuplicate}
@@ -329,6 +390,7 @@ export default function Home() {
 
 function JokeCard({
   joke,
+  rating,
   onRate,
   onReport,
   onReportDuplicate,
@@ -336,6 +398,7 @@ function JokeCard({
   onShare,
 }: {
   joke: Joke;
+  rating: { avg: number; count: number };
   onRate: (id: string, score: number) => void;
   onReport: (id: string) => void;
   onReportDuplicate: (id: string) => void;
@@ -353,8 +416,9 @@ function JokeCard({
       <div className="flex justify-between items-center flex-wrap gap-2 text-xs text-gray-500">
         <div className="flex items-center gap-1.5">
           <span className="font-black text-sm text-ink">
-            {joke.total_ratings > 0 ? `${joke.avg_rating.toFixed(1)}/10` : '—'}
+            {rating.count > 0 ? `${rating.avg.toFixed(1)}/10` : '—'}
           </span>
+          <span className="text-gray-400">({rating.count})</span>
           <select
             onChange={(e) => e.target.value && onRate(joke.id, Number(e.target.value))}
             className="border border-ink bg-transparent text-xs px-1"
