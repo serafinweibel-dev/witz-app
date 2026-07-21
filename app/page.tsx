@@ -3,8 +3,16 @@
 import { useEffect, useState } from 'react';
 import { supabase, Joke, Category, getVisitorId, getNickname, setNickname } from '@/lib/supabase';
 
-type Tab = 'list' | 'new' | 'leader';
+type Tab = 'list' | 'new' | 'leader' | 'changes';
 type RatingRow = { joke_id: string; user_id_or_ip: string; score: number };
+type OptimizationRow = {
+  id: string;
+  joke_id: string;
+  suggested_text: string;
+  status: string;
+  votes: number;
+  created_at: string;
+};
 
 function hashCode(str: string): number {
   let hash = 0;
@@ -19,13 +27,15 @@ export default function Home() {
   const [tab, setTab] = useState<Tab>('list');
   const [jokes, setJokes] = useState<Joke[]>([]);
   const [allRatings, setAllRatings] = useState<RatingRow[]>([]);
+  const [allOptimizations, setAllOptimizations] = useState<OptimizationRow[]>([]);
   const [categories, setCategories] = useState<Category[]>([]);
   const [loading, setLoading] = useState(true);
   const [nickname, setNick] = useState('');
   const [filterCat, setFilterCat] = useState('Alle');
-  const [sort, setSort] = useState<'new' | 'top' | 'random'>('top');
+  const [search, setSearch] = useState('');
+  const [sort, setSort] = useState<'new' | 'top' | 'random'>('random');
   const [excludeOwn, setExcludeOwn] = useState(false);
-  const [randomSeed, setRandomSeed] = useState(0);
+  const [randomSeed, setRandomSeed] = useState(() => Math.random());
   const [leaderboard, setLeaderboard] = useState<{ username: string; credits: number }[]>([]);
 
   useEffect(() => {
@@ -33,6 +43,7 @@ export default function Home() {
     loadCategories();
     loadJokes();
     loadAllRatings();
+    loadAllOptimizations();
   }, []);
 
   async function loadCategories() {
@@ -57,16 +68,44 @@ export default function Home() {
     if (data) setAllRatings(data as RatingRow[]);
   }
 
+  async function loadAllOptimizations() {
+    const { data } = await supabase
+      .from('joke_optimizations')
+      .select('id, joke_id, suggested_text, status, created_at')
+      .order('created_at', { ascending: false });
+    if (!data) return;
+    const { data: votes } = await supabase.from('optimization_votes').select('optimization_id');
+    const voteCounts: Record<string, number> = {};
+    (votes || []).forEach((v: any) => {
+      voteCounts[v.optimization_id] = (voteCounts[v.optimization_id] || 0) + 1;
+    });
+    setAllOptimizations(
+      (data as any[]).map((o) => ({ ...o, votes: voteCounts[o.id] || 0 }))
+    );
+  }
+
+  // Eigene Bewertungen = dieses Geraet ODER die urspruenglichen Excel-Bewertungen
+  const OWN_MARKER = 'excel_import_serafin';
+
   // Durchschnitt und Anzahl fuer einen Witz berechnen - je nachdem ob eigene
-  // Bewertungen (dieses Geraet) ausgeschlossen werden sollen
+  // Bewertungen (dieses Geraet + Excel-Import) ausgeschlossen werden sollen
   function computeRating(jokeId: string): { avg: number; count: number } {
     const myId = getVisitorId();
     const relevant = allRatings.filter(
-      (r) => r.joke_id === jokeId && (!excludeOwn || r.user_id_or_ip !== myId)
+      (r) =>
+        r.joke_id === jokeId &&
+        (!excludeOwn || (r.user_id_or_ip !== myId && r.user_id_or_ip !== OWN_MARKER))
     );
     if (!relevant.length) return { avg: 0, count: 0 };
     const sum = relevant.reduce((a, r) => a + r.score, 0);
     return { avg: sum / relevant.length, count: relevant.length };
+  }
+
+  // Eigene bereits abgegebene Bewertung fuer einen Witz finden (fuer Hervorhebung)
+  function getMyRating(jokeId: string): number | null {
+    const myId = getVisitorId();
+    const mine = allRatings.find((r) => r.joke_id === jokeId && r.user_id_or_ip === myId);
+    return mine ? mine.score : null;
   }
 
   async function loadLeaderboard() {
@@ -220,7 +259,34 @@ export default function Home() {
       proposer_id: proposerId,
       suggested_text: text.trim(),
     });
+    await loadAllOptimizations();
     alert('Vorschlag eingereicht.');
+  }
+
+  async function voteOptimization(optimizationId: string) {
+    if (!ensureNick()) return;
+    const visitorId = getVisitorId();
+    const { error } = await supabase.from('optimization_votes').insert({
+      optimization_id: optimizationId,
+      voter_id_or_ip: visitorId,
+    });
+    if (error) {
+      if (error.code === '23505') alert('Du hast bereits dafuer gestimmt.');
+      else alert('Fehler: ' + error.message);
+      return;
+    }
+    await loadAllOptimizations();
+  }
+
+  async function applyOptimization(jokeId: string, optimizationId: string, newText: string) {
+    if (!confirm('Diesen Witz-Text durch den Vorschlag ersetzen?')) return;
+    await supabase.from('jokes').update({ content: newText }).eq('id', jokeId);
+    await supabase
+      .from('joke_optimizations')
+      .update({ status: 'accepted' })
+      .eq('id', optimizationId);
+    await loadJokes();
+    await loadAllOptimizations();
   }
 
   async function shareJoke(joke: Joke) {
@@ -241,6 +307,11 @@ export default function Home() {
   let visibleJokes = filterCat === 'Alle'
     ? jokes
     : jokes.filter((j) => j.categories?.name === filterCat);
+
+  if (search.trim()) {
+    const q = search.trim().toLowerCase();
+    visibleJokes = visibleJokes.filter((j) => j.content.toLowerCase().includes(q));
+  }
 
   if (sort === 'new') {
     visibleJokes = [...visibleJokes].sort(
@@ -279,7 +350,7 @@ export default function Home() {
       </div>
 
       <div className="flex border border-ink mb-5">
-        {(['list', 'new', 'leader'] as Tab[]).map((t) => (
+        {(['list', 'new', 'leader', 'changes'] as Tab[]).map((t) => (
           <button
             key={t}
             onClick={() => {
@@ -290,7 +361,13 @@ export default function Home() {
               tab === t ? 'bg-ink text-paper' : ''
             }`}
           >
-            {t === 'list' ? 'Alle Witze' : t === 'new' ? 'Neuer Witz' : 'Bestenliste'}
+            {t === 'list'
+              ? 'Alle Witze'
+              : t === 'new'
+              ? 'Neuer Witz'
+              : t === 'leader'
+              ? 'Bestenliste'
+              : 'Änderungen'}
           </button>
         ))}
       </div>
@@ -298,6 +375,13 @@ export default function Home() {
       {tab === 'list' && (
         <>
           <div className="flex gap-2 mb-4 flex-wrap items-center">
+            <input
+              type="text"
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Witze durchsuchen..."
+              className="border border-ink bg-white px-2 py-1.5 text-xs flex-1 min-w-[160px]"
+            />
             <select
               value={filterCat}
               onChange={(e) => setFilterCat(e.target.value)}
@@ -349,10 +433,15 @@ export default function Home() {
                 key={j.id}
                 joke={j}
                 rating={computeRating(j.id)}
+                myRating={getMyRating(j.id)}
+                optimizations={allOptimizations.filter(
+                  (o) => o.joke_id === j.id && o.status === 'pending'
+                )}
                 onRate={rateJoke}
                 onReport={reportJoke}
                 onReportDuplicate={reportDuplicate}
                 onOptimize={suggestOptimization}
+                onVoteOptimization={voteOptimization}
                 onShare={shareJoke}
               />
             ))
@@ -384,6 +473,49 @@ export default function Home() {
           )}
         </div>
       )}
+
+      {tab === 'changes' && (
+        <div>
+          {allOptimizations.length === 0 ? (
+            <div className="text-center text-gray-500 text-sm py-10">
+              Noch keine Vorschläge eingereicht.
+            </div>
+          ) : (
+            allOptimizations.map((o) => {
+              const relatedJoke = jokes.find((j) => j.id === o.joke_id);
+              return (
+                <div key={o.id} className="border border-ink bg-white p-4 mb-3.5">
+                  <div className="flex justify-between items-center mb-2">
+                    <span
+                      className={`text-[10px] uppercase tracking-wide font-bold px-1.5 py-0.5 border ${
+                        o.status === 'accepted'
+                          ? 'border-accent text-accent'
+                          : 'border-ink text-gray-500'
+                      }`}
+                    >
+                      {o.status === 'accepted' ? 'Übernommen' : `${o.votes}/10 Stimmen`}
+                    </span>
+                    <span className="text-[10px] text-gray-400">
+                      {new Date(o.created_at).toLocaleDateString('de-CH')}
+                    </span>
+                  </div>
+                  {relatedJoke && (
+                    <div className="text-xs text-gray-500 mb-1.5">
+                      {o.status === 'accepted' ? 'Witz (jetzt aktuell)' : 'Aktueller Witz'}:{' '}
+                      {o.status === 'accepted' ? (
+                        relatedJoke.content
+                      ) : (
+                        <span className="line-through">{relatedJoke.content}</span>
+                      )}
+                    </div>
+                  )}
+                  <div className="text-sm font-medium">Vorschlag: {o.suggested_text}</div>
+                </div>
+              );
+            })
+          )}
+        </div>
+      )}
     </main>
   );
 }
@@ -391,20 +523,28 @@ export default function Home() {
 function JokeCard({
   joke,
   rating,
+  myRating,
+  optimizations,
   onRate,
   onReport,
   onReportDuplicate,
   onOptimize,
+  onVoteOptimization,
   onShare,
 }: {
   joke: Joke;
   rating: { avg: number; count: number };
+  myRating: number | null;
+  optimizations: OptimizationRow[];
   onRate: (id: string, score: number) => void;
   onReport: (id: string) => void;
   onReportDuplicate: (id: string) => void;
   onOptimize: (id: string, current: string) => void;
+  onVoteOptimization: (optimizationId: string) => void;
   onShare: (joke: Joke) => void;
 }) {
+  const sortedOptimizations = [...optimizations].sort((a, b) => b.votes - a.votes);
+
   return (
     <div className="border border-ink bg-white p-4 mb-3.5">
       <div className="flex justify-between text-[10px] uppercase tracking-wide text-gray-500 mb-2">
@@ -413,25 +553,24 @@ function JokeCard({
         </span>
       </div>
       <div className="text-base font-medium leading-snug mb-2.5">{joke.content}</div>
-      <div className="flex justify-between items-center flex-wrap gap-2 text-xs text-gray-500">
-        <div className="flex items-center gap-1.5">
-          <span className="font-black text-sm text-ink">
-            {rating.count > 0 ? `${rating.avg.toFixed(1)}/10` : '—'}
-          </span>
-          <span className="text-gray-400">({rating.count})</span>
-          <select
-            onChange={(e) => e.target.value && onRate(joke.id, Number(e.target.value))}
-            className="border border-ink bg-transparent text-xs px-1"
-            defaultValue=""
+      <div className="flex items-center gap-2 text-xs text-gray-500 mb-1">
+        <span className="font-black text-sm text-ink">
+          {rating.count > 0 ? `${rating.avg.toFixed(1)}/10` : '—'}
+        </span>
+        <span className="text-gray-400">({rating.count})</span>
+      </div>
+      <div className="flex gap-1 flex-wrap mb-2.5">
+        {[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((n) => (
+          <button
+            key={n}
+            onClick={() => onRate(joke.id, n)}
+            className={`w-7 h-7 text-xs font-bold border border-ink ${
+              myRating === n ? 'bg-ink text-paper' : 'bg-white text-ink hover:bg-gray-100'
+            }`}
           >
-            <option value="">Bewerten</option>
-            {[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((n) => (
-              <option key={n} value={n}>
-                {n}
-              </option>
-            ))}
-          </select>
-        </div>
+            {n}
+          </button>
+        ))}
       </div>
       <div className="flex gap-3 mt-2.5 flex-wrap text-[11px] uppercase tracking-wide">
         <button onClick={() => onShare(joke)} className="underline text-gray-500">
@@ -453,6 +592,23 @@ function JokeCard({
           Melden
         </button>
       </div>
+      {sortedOptimizations.length > 0 && (
+        <div className="border-t border-dashed border-gray-400 mt-2.5 pt-2.5">
+          {sortedOptimizations.slice(0, 3).map((o) => (
+            <div key={o.id} className="flex justify-between items-center gap-2 text-xs mb-1.5">
+              <span className="flex-1">
+                "{o.suggested_text}" — {o.votes}/10 Stimmen
+              </span>
+              <button
+                onClick={() => onVoteOptimization(o.id)}
+                className="border border-ink px-1.5 py-0.5 text-[10px] uppercase"
+              >
+                +1
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
